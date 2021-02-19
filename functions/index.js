@@ -6,6 +6,38 @@ const fetch = require('node-fetch');
 const cookieParser = require('cookie-parser')();
 const cors = require('cors')({origin: true});
 
+// util
+const getTime = (timestamp = null) => {
+    // eslint-disable-next-line no-extend-native
+    Date.prototype.format = function (fmt) {
+        const o = {
+            'M+': this.getMonth() + 1, // 月份
+            'd+': this.getDate(), // 日
+            'h+': this.getHours(), // 小时
+            'm+': this.getMinutes(), // 分
+            's+': this.getSeconds(), // 秒
+            'q+': Math.floor((this.getMonth() + 3) / 3), // 季度
+            S: this.getMilliseconds(), // 毫秒
+        };
+        if (/(y+)/.test(fmt)) {
+            // eslint-disable-next-line no-param-reassign
+            fmt = fmt.replace(RegExp.$1, (`${this.getFullYear()}`).substr(4 - RegExp.$1.length));
+        }
+        // eslint-disable-next-line no-restricted-syntax
+        for (const k in o) {
+            if (new RegExp(`(${k})`).test(fmt)) {
+                // eslint-disable-next-line no-param-reassign,eqeqeq
+                fmt = fmt.replace(RegExp.$1, (RegExp.$1.length == 1) ? (o[k]) : ((`00${o[k]}`).substr((`${o[k]}`).length)));
+            }
+        }
+        return fmt;
+    };
+    if (timestamp) {
+        return new Date(timestamp);
+    }
+    return new Date();
+};
+
 const app = express();
 const noAuth = express();
 
@@ -18,6 +50,7 @@ noAuth.all('*', function(req, res, next) {
     res.header("Access-Control-Allow-Methods","PUT,POST,GET,DELETE,OPTIONS");
     next();
 });
+
 
 const validateFirebaseIdToken = async (req, res, next) => {
     console.log('Check if request is authorized with Firebase ID token');
@@ -93,7 +126,7 @@ app.post('/register', (req, res) => {
         .catch(error => console.error("Error adding document: ", error))
 })
 
-app.post('/depositBooking', (req,res) => {
+app.post('/depositBooking', async (req,res) => {
     const body = req.body
     const oneNumber = parseInt(body.oneNumber)
     const twoNumber = parseInt(body.twoNumber)
@@ -104,7 +137,7 @@ app.post('/depositBooking', (req,res) => {
     const weeks =  Math.ceil((Date.parse(body.endDate) - Date.parse(body.startDate)) / 1000/60/60/24/7)
     const totalPrice = (oneNumber+ 2*twoNumber+ 3*threeNumber)*weeks
 
-    admin.firestore().collection('deposit').add({
+    await admin.firestore().collection('deposit').add({
         oneNumber: oneNumber,
         twoNumber: twoNumber,
         threeNumber: threeNumber,
@@ -114,21 +147,63 @@ app.post('/depositBooking', (req,res) => {
         weeks: weeks,
         user: req.user.uid,
         totalPrice: totalPrice
+    });
+    res.send({
+        state: 200,
+        payload: "booking success"
     })
-        .then(() => {
-            res.send({
-                state: 200,
-                payload: "booking success"
-            })
-            return
-        })
-        .catch(err => {
-            res.send({
-                state: 400,
-                payload: err
-            })
-        })
+    const tokenRef =  admin.firestore().collection("tokens").doc('wechat');
+    const doc = await tokenRef.get();
+    if (!doc.exists) return;
+    const result = doc.data();
+    let text = '';
+    if(oneNumber) {
+        text += `吉他/中箱/登机箱数量: ${oneNumber}\n`
+    }
+    if(twoNumber) {
+        text += `大箱数量: ${twoNumber}\n`
+    }
+    if(threeNumber) {
+        text += `行李箱/超出尺寸箱数量: ${threeNumber}\n`
+    }
+    const params = {
+        touser: "WangJinTao|HongXia",
+        msgtype: "text",
+        agentid: 1000002,
+        text: {
+            content: `测试 有新的寄存订单啦!\n\n${text}寄存开始时间： ${getTime(startDate).format('yyyy-MM-dd')}\n寄存结束时间： ${getTime(body.endDate).format('yyyy-MM-dd')}\n寄存周数： ${weeks}周\n寄存价格：£${totalPrice}
+            `,
+        }
+    }
+    // 判断token是否超时，超时重新请求并更新token和时间
+    if(result.expires_in < new Date().getTime()) {
+        const getTokenRes = await fetch('https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=ww4efc014f0d230828&corpsecret=GSbjyqZ7jzaQH72q1H_QlkKoXwo6vGu5ZKhFKdz3ZPo');
+        // 请求失败
+        if (!getTokenRes.ok) return;
+        const result = await getTokenRes.json();
+        const expires_in = new Date().getTime() + result.expires_in * 1000;
 
+        await tokenRef.update({
+            access_token: result.access_token,
+            expires_in: expires_in.toString(),
+        });
+
+        await fetch(
+          `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${result.access_token}`,
+          {
+              method: 'POST',
+              body: JSON.stringify(params),
+          },
+        )
+        return;
+    }
+    await fetch(
+      `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${result.access_token}`,
+      {
+          method: 'POST',
+          body: JSON.stringify(params),
+      },
+    )
 })
 
 noAuth.get('/getAllItems', (req, res) => {
@@ -182,6 +257,7 @@ noAuth.get('/testGetToken', async (req, res) => {
             payload: {
                 access_token: result.access_token,
                 expires_in: expires_in.toString(),
+                source: 'wechatApi',
             },
         })
         await tokenRef.update({
@@ -193,7 +269,8 @@ noAuth.get('/testGetToken', async (req, res) => {
 
     res.send({
         state: 200,
-        payload: doc.data()
+        payload: doc.data(),
+        source: 'firebaseCache',
     })
 })
 
